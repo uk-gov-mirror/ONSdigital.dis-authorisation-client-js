@@ -6,7 +6,7 @@ image_resource:
   type: docker-image
   source:
     repository: node
-    tag: 22.11.0
+    tag: 24.16.0
 
 inputs:
   - name: dis-authorisation-client-js
