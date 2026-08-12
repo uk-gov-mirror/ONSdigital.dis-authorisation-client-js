@@ -2,6 +2,7 @@ import {
   createDefaultExpiryTimes,
   checkSessionStatus,
   renewSession,
+  expireSession,
   isSessionExpired,
   validateExpiryTime,
 } from './utils.js';
@@ -214,6 +215,32 @@ describe('Utils', () => {
       global.fetch.mockResolvedValueOnce({ ok: false, status: 500 });
 
       await expect(renewSession({})).rejects.toThrow('Failed to renew session');
+    });
+  });
+
+  describe('expireSession', () => {
+    beforeEach(() => {
+      global.fetch = jest.fn();
+    });
+
+    test('should send a DELETE request to the expire session endpoint', async () => {
+      global.fetch.mockResolvedValueOnce({ ok: true });
+
+      await expireSession('/api/v1/tokens/self');
+
+      expect(fetch).toHaveBeenCalledWith('/api/v1/tokens/self', { method: 'DELETE' });
+    });
+
+    test('should resolve without error on a successful response', async () => {
+      global.fetch.mockResolvedValueOnce({ ok: true });
+
+      await expect(expireSession('/api/v1/tokens/self')).resolves.toBeUndefined();
+    });
+
+    test('should throw an error when the response is not ok', async () => {
+      global.fetch.mockResolvedValueOnce({ ok: false, status: 401 });
+
+      await expect(expireSession('/api/v1/tokens/self')).rejects.toThrow('Failed to expire session');
     });
   });
 });

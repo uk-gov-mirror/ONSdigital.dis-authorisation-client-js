@@ -1,9 +1,13 @@
 import fp from 'lodash/fp.js';
+import debounce from 'lodash/debounce.js';
 import defaultConfig from '../config/config.js';
 import {
-  checkSessionStatus, renewSession, validateExpiryTime,
+  checkSessionStatus, renewSession, validateExpiryTime, expireSession,
 } from '../utils/utils.js';
 import { updateAuthState, getAuthState, removeAuthState } from '../utils/auth.js';
+import {
+  monitorInteraction, removeInteractionMonitoring, checkForInactivity, logLastInteraction,
+} from '../utils/interaction.js';
 
 class SessionManagement {
   static instance;
@@ -14,13 +18,12 @@ class SessionManagement {
     }
 
     this.config = {};
-    this.timers = {};
     this.eventsToMonitor = ['mousedown', 'mousemove', 'keypress', 'scroll', 'touchstart'];
 
     // Bind methods to the instance
     this.refreshSession = this.refreshSession.bind(this);
-    this.monitorInteraction = this.monitorInteraction.bind(this);
-    this.removeInteractionMonitoring = this.removeInteractionMonitoring.bind(this);
+    this.monitorInteractionsForSessionActivity = this.monitorInteractionsForSessionActivity.bind(this);
+    this.manageSessionActivity = debounce(this.manageSessionActivity.bind(this), 500);
 
     SessionManagement.instance = this;
   }
@@ -64,25 +67,21 @@ class SessionManagement {
 
       if (finalSessionExpiryTime) {
         console.debug(`[LIBRARY] Session expiry time: ${finalSessionExpiryTime}`);
-        this.startSessionTimer(finalSessionExpiryTime);
-      }
-      if (finalRefreshExpiryTime) {
-        console.debug(`[LIBRARY] Refresh expiry time: ${finalRefreshExpiryTime}`);
-        this.startRefreshTimer(finalRefreshExpiryTime);
-      }
-      if (!finalSessionExpiryTime && !finalRefreshExpiryTime) {
-        console.error('[LIBRARY] Failed to initialise session expiry timers: No expiry times provided');
-        this.handleSessionValidity(false);
-      } else {
+        SessionManagement.startSessionTimer(finalSessionExpiryTime);
         this.handleSessionValidity(true, finalSessionExpiryTime, finalRefreshExpiryTime);
+      } else {
+        console.debug('[LIBRARY] No session expiry time found, handling session as invalid');
+        this.handleSessionValidity(false);
       }
+
+      this.monitorInteractionsForSessionActivity();
     } catch (error) {
       console.error('[LIBRARY] Failed to initialise session expiry timers:', error);
       this.handleSessionValidity(false);
     }
   }
 
-  handleSessionValidity(isValid, sessionExpiryTime, refreshExpiryTime) {
+  async handleSessionValidity(isValid, sessionExpiryTime, refreshExpiryTime) {
     const { onSessionValid, onSessionInvalid } = this.config;
 
     if (isValid && onSessionValid) {
@@ -92,65 +91,55 @@ class SessionManagement {
 
     if (!isValid && onSessionInvalid) {
       onSessionInvalid();
+      try {
+        await this.logout();
+      } catch (error) {
+        console.error('[LIBRARY] Logout failed:', error);
+        if (this.config.onError) this.config.onError(error);
+      }
+
       return;
     }
 
     console.debug(`[LIBRARY] No ${isValid ? 'onSessionValid' : 'onSessionInvalid'} callback provided.`);
   }
 
-  startSessionTimer(sessionExpiryTime) {
-    updateAuthState({ session_expiry_time: sessionExpiryTime });
-    this.startExpiryTimer(
-      'sessionTimerPassive',
-      sessionExpiryTime,
-      this.monitorInteraction,
-    );
-  }
-
-  startRefreshTimer(refreshExpiryTime) {
-    updateAuthState({ refresh_expiry_time: refreshExpiryTime });
-    this.startExpiryTimer(
-      'refreshTimerPassive',
-      refreshExpiryTime,
-      this.monitorInteraction,
-    );
-  }
-
-  startExpiryTimer(name, expiryTime, callback) {
-    console.debug(`[LIBRARY] Expiry time for ${name}: ${expiryTime}`);
-    if (expiryTime) {
-      const now = new Date();
-      const timerInterval = new Date(expiryTime) - now.getTime() - this.config.timeOffsets.passiveRenewal;
-      console.debug(`[LIBRARY] Offset for ${name}: ${this.config.timeOffsets.passiveRenewal}`);
-      if (Number.isNaN(timerInterval)) {
-        console.error(`[LIBRARY] time interval for ${name} is not a valid date format: ${timerInterval}`);
-        return;
-      }
-      if (this.timers[name] != null) {
-        clearTimeout(this.timers[name]);
-      }
-      console.debug(`[LIBRARY] Interval for ${name} set to ${timerInterval}`);
-      this.timers[name] = setTimeout(callback, timerInterval);
+  async manageSessionActivity() {
+    // first check to see if the user has been inactive for longer than the inactivity threshold
+    if (checkForInactivity(this.config.timeOffsets.inactivityThreshold)) {
+      console.debug('[LIBRARY] User has been inactive for longer than the inactivity threshold, handling session as invalid');
+      await this.handleSessionValidity(false);
+      return;
     }
+    const { checkedSessionExpiryTime } = await checkSessionStatus();
+    if (!checkedSessionExpiryTime) {
+      console.debug('[LIBRARY] No session expiry time found, handling session as invalid');
+      await this.handleSessionValidity(false);
+      return;
+    }
+
+    const sessionRenewalTime = new Date(checkedSessionExpiryTime).getTime() - this.config.timeOffsets.passiveRenewal;
+
+    if (checkedSessionExpiryTime > 0 && sessionRenewalTime < Date.now()) {
+      console.debug('[LIBRARY] Session renewal time has passed, attempting to refresh session');
+      console.debug('[LIBRARY] Session expiry time: ', sessionRenewalTime);
+      await this.refreshSession();
+    }
+    console.debug('[LIBRARY] Logging user interaction');
+    logLastInteraction();
   }
 
-  monitorInteraction() {
-    console.debug('[LIBRARY] Event listeners added: ', this.eventsToMonitor);
-    this.eventsToMonitor.forEach((name) => {
-      document.addEventListener(name, this.refreshSession);
-    });
+  monitorInteractionsForSessionActivity() {
+    console.debug('[LIBRARY] Monitoring for user interaction to manage session activity');
+    monitorInteraction(this.manageSessionActivity);
   }
 
-  removeInteractionMonitoring() {
-    console.debug('[LIBRARY] Removing interaction monitoring');
-    this.eventsToMonitor.forEach((name) => {
-      document.removeEventListener(name, this.refreshSession);
-    });
+  static startSessionTimer(sessionExpiryTime) {
+    updateAuthState({ session_expiry_time: sessionExpiryTime });
   }
 
   async refreshSession() {
     console.debug('[LIBRARY] Refreshing session');
-    this.removeInteractionMonitoring();
     const renewError = (error) => {
       console.error("[LIBRARY] an unexpected error has occurred when extending the user's session: ", error);
       if (error != null) {
@@ -172,7 +161,7 @@ class SessionManagement {
           '[LIBRARY] Session renewed successfully, new converted expiration time:',
           expirationTime,
         );
-        this.startSessionTimer(expirationTime);
+        SessionManagement.startSessionTimer(expirationTime);
         if (this.config.onRenewSuccess) {
           const refreshExpiryTime = fp.get('refresh_expiry_time')(getAuthState());
           this.config.onRenewSuccess(expirationTime, refreshExpiryTime);
@@ -185,13 +174,22 @@ class SessionManagement {
     }
   }
 
+  async logout() {
+    try {
+      await expireSession(this.config.apiEndpoints.expireSession);
+    } catch (error) {
+      console.error('[LIBRARY] Failed to expire session:', error);
+      if (this.config.onError) this.config.onError(error);
+    }
+    // Even if the expire session request fails, we still want to clear the auth state and redirect the user to the login page.
+    this.removeTimers();
+    const next = encodeURIComponent(window.location.pathname);
+    window.location.href = `${this.config.loginUrl}?next=${next}`;
+  }
+
   removeTimers() {
-    this.removeInteractionMonitoring();
-    Object.values(this.timers).forEach((timer) => {
-      clearTimeout(timer);
-    });
+    removeInteractionMonitoring(this.manageSessionActivity);
     removeAuthState();
-    this.timers = {};
   }
 }
 
