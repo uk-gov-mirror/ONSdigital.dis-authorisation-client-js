@@ -48,6 +48,20 @@ export async function checkSessionStatus() {
   return { checkedSessionExpiryTime: null, checkedRefreshExpiryTime: null };
 }
 
+export async function expireSession(expireSessionEndpoint) {
+  console.debug('[LIBRARY] Expiring session');
+  const response = await fetch(expireSessionEndpoint, {
+    method: 'DELETE',
+  });
+
+  if (!response.ok) {
+    console.error('[LIBRARY] Failed to expire session, response status:', response.status);
+    throw new Error('Failed to expire session');
+  }
+
+  console.debug('[LIBRARY] Session expired successfully');
+}
+
 export async function renewSession(renewSessionEndpoint, body) {
   console.debug('[LIBRARY] Starting session renewal process: ', body);
   const response = await fetch(renewSessionEndpoint, {
